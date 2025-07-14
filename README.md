@@ -1,2 +1,3 @@
 # frida_trace
-针对arm64架构的so进行trace
+针对arm64架构的so进行trace，可能有些寄存器hook的不全，自行修改一下根据需要
+感觉有些臃肿，可能不能大规模trace，可以自行精简一下，使用CModule修改一下
