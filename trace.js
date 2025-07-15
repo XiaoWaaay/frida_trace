@@ -67,23 +67,16 @@ function padRight(str, len) {
 // 4. 只提取当前指令中出现的x系列寄存器，只保留不在[]里面的寄存器
 function hook_reg(instructionStr) {
     const regList = getRegisterList();
-    // 提取所有可能的寄存器名（q12、d31、s0、x5、sp、pc、lr、fp、nzcv、ip0、ip1等）
     const regex = /\b([a-z]{1,4}[0-9]{0,2})\b/gi;
     let match;
     const allRegs = new Set();
     while ((match = regex.exec(instructionStr)) !== null) {
         const reg = match[1].toLowerCase();
         if (regList.includes(reg)) {
-            // w系列寄存器全部转为x系列
-            if (/^w\d+$/.test(reg)) {
-                allRegs.add('x' + reg.slice(1));
-            } else {
-                allRegs.add(reg);
-            }
+            allRegs.add(reg); // 保留原寄存器名（不要转 x）
         }
     }
 
-    // 找出所有在[]里的寄存器（寻址寄存器，不打印）
     const inBracket = new Set();
     const bracketRegex = /\[([^\]]+)\]/g;
     let m;
@@ -93,18 +86,14 @@ function hook_reg(instructionStr) {
             .forEach(word => {
                 const reg = word.toLowerCase();
                 if (regList.includes(reg)) {
-                    if (/^w\d+$/.test(reg)) {
-                        inBracket.add('x' + reg.slice(1));
-                    } else {
-                        inBracket.add(reg);
-                    }
+                    inBracket.add(reg);
                 }
             });
     }
 
-    // 只返回不在[]里的寄存器
     return Array.from(allRegs).filter(reg => !inBracket.has(reg));
 }
+
 
 
 
@@ -125,21 +114,25 @@ function get_regvalue(regList, context) {
     if (regList !== null) {
         regList.forEach(reg => {
             let regVal;
-            if (reg.startsWith('w') && context['x' + reg.slice(1)] !== undefined) {
+
+            if (reg === "x29") {
+                regVal = context.fp;
+            } else if (reg === "x30") {
+                regVal = context.lr;
+            }
+
+            // 如果是 w 寄存器，用对应 x 读取
+            else if (reg.startsWith('w')) {
                 const xRegName = 'x' + reg.slice(1);
                 regVal = context[xRegName];
             }
-            else if (reg == "x29") {
-                regVal = context.sp;
-            }
-            else if (reg == "x30") {
-                regVal = context["lr"];
-            }
+
+            // q寄存器
             else if (reg.startsWith('q')) {
                 try {
                     let v = context[reg];
                     if (v instanceof ArrayBuffer) {
-                        regVal = arrayBufferToHex(v);  // 正确转换为hex
+                        regVal = arrayBufferToHex(v);
                     } else if (v && v.toString) {
                         regVal = v.toString();
                     } else {
@@ -149,13 +142,20 @@ function get_regvalue(regList, context) {
                     regVal = 'q-register-error';
                 }
             }
+
+            // 其他寄存器
             else {
                 regVal = context[reg];
             }
+
             if (regVal !== undefined) {
-                registerValues += `${reg}: ${regVal}\t`;
+                if (typeof regVal === 'number') {
+                    registerValues += `${reg}: 0x${regVal.toString(16)}\t`;
+                } else {
+                    registerValues += `${reg}: ${regVal}\t`;
+                }
             } else {
-                registerValues += `${reg}: Register not found\t`;
+                registerValues += `${reg}: (undefined)\t`;
             }
         });
     }
@@ -164,25 +164,30 @@ function get_regvalue(regList, context) {
 
 
 
+
+
 // 6. 根据寄存器名数组，从 prevContext 取值，w系列转x系列
 function get_regvalue_from_sp(last_reg, prevContext) {
     let result = '';
     last_reg.forEach(reg => {
-        let regVal = prevContext[reg];
+        let regVal = undefined;
 
-        // 如果是 w 寄存器，优先转 x
-        if (reg.startsWith('w')) {
-            const xRegName = 'x' + reg.slice(1);
-            if (prevContext[xRegName] !== undefined) {
-                regVal = prevContext[xRegName];
-            }
+        if (reg === "x29") {
+            regVal = prevContext.fp;
+        } else if (reg === "x30") {
+            regVal = prevContext.lr;
         }
 
-        // 如果是 q 寄存器，转 ArrayBuffer 为 hex
+        else if (reg.startsWith('w')) {
+            const xRegName = 'x' + reg.slice(1);
+            regVal = prevContext[xRegName];
+        }
+
         else if (reg.startsWith('q')) {
             try {
+                regVal = prevContext[reg];
                 if (regVal instanceof ArrayBuffer) {
-                    regVal = arrayBufferToHex(regVal);  // 使用同一转换函数
+                    regVal = arrayBufferToHex(regVal);
                 } else if (regVal && regVal.toString) {
                     regVal = regVal.toString();
                 } else {
@@ -191,7 +196,12 @@ function get_regvalue_from_sp(last_reg, prevContext) {
             } catch (e) {
                 regVal = 'q-register-error';
             }
+        } else {
+            regVal = prevContext[reg];
         }
+
+        if (regVal === undefined) regVal = "(undefined)";
+        else if (typeof regVal === 'number') regVal = `0x${regVal.toString(16)}`;
 
         result += `${reg}: ${regVal}\t`;
     });
@@ -199,12 +209,13 @@ function get_regvalue_from_sp(last_reg, prevContext) {
 }
 
 
+
+
+
 // 7. 对比寄存器值并格式化美观输出
 function compare_regvalues(last_regvalue, now_regvalue) {
     let result = '';
-    let hasChange = false;
 
-    // 字符串转对象
     function parse_regvalue(regvalue) {
         const regObj = {};
         const regPairs = regvalue.split('\t').map(s => s.trim()).filter(Boolean);
@@ -222,29 +233,34 @@ function compare_regvalues(last_regvalue, now_regvalue) {
     const lastRegObj = parse_regvalue(last_regvalue);
     const nowRegObj = parse_regvalue(now_regvalue);
 
-    let rows = [];
-    for (let reg in lastRegObj) {
-        if (nowRegObj[reg] !== undefined) {
-            const prevVal = lastRegObj[reg];
-            const nowVal = nowRegObj[reg];
+    const rows = [];
+
+    const allRegs = new Set([...Object.keys(lastRegObj), ...Object.keys(nowRegObj)]);
+
+    for (const reg of allRegs) {
+        const prevVal = lastRegObj[reg];
+        const nowVal = nowRegObj[reg];
+
+        if (prevVal !== undefined && nowVal !== undefined) {
             if (prevVal !== nowVal) {
-                hasChange = true;
                 rows.push(`${reg}: ${prevVal} ==> ${nowVal}`);
+            } else {
+                rows.push(`${reg}: ${nowVal}`);
             }
+        } else if (prevVal !== undefined && nowVal === undefined) {
+            rows.push(`${reg}: ${prevVal} ==> (missing)`);
+        } else if (prevVal === undefined && nowVal !== undefined) {
+            rows.push(`${reg}: (missing) ==> ${nowVal}`);
+        } else {
+            rows.push(`${reg}: (undefined)`);
         }
     }
-    if (hasChange) {
-        result = rows.join('\t');  // 变化寄存器直接用tab分隔
-    } else {
-        // 没有变化就全打印出来，寄存器之间tab分隔
-        let unchangedRows = [];
-        for (let reg in lastRegObj) {
-            unchangedRows.push(`${reg}: ${lastRegObj[reg]}`);
-        }
-        result = unchangedRows.join('\t');
-    }
+
+    result = rows.join('\t');
     return result;
 }
+
+
 
 
 // 8. 打印内存变化
@@ -353,7 +369,6 @@ function trace(soname, start, size) {
                                 console.log()
 
 
-
                             } else {
                                 output = `${padRight(lastaddr, 12)} [${soname} ${padRight(lastoffset, 12)}]: ${padRight(lastcode, 48)}`;
 
@@ -392,8 +407,9 @@ function trace(soname, start, size) {
 
 // ============ 配置目标模块、基址和追踪范围 ===========
 var soname = 'libapp.so';
-var startaddr = 0x2d8f60;
-var size = 0x324;
+var startaddr =0x2d3cd0;
+var endaddr=startaddr+0x534 
+var size = endaddr-startaddr;
 setTimeout(trace(soname, startaddr, size),1000);
 
 
